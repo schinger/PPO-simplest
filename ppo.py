@@ -77,7 +77,7 @@ class MLPCategoricalActor(Actor):
     
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
         super().__init__()
-        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [2], activation)
 
     def _distribution(self, obs):
         logits = self.logits_net(obs)
@@ -118,11 +118,11 @@ class MLPCritic(nn.Module):
 class MLPActorCritic(nn.Module):
 
 
-    def __init__(self, observation_space, action_space, 
+    def __init__(self, observation_dim, action_space, 
                  hidden_sizes=(64,64), activation=nn.Tanh):
         super().__init__()
 
-        obs_dim = observation_space.shape[0]
+        obs_dim = observation_dim
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
@@ -141,8 +141,29 @@ class MLPActorCritic(nn.Module):
             v = self.v(obs)
         return a.numpy(), v.numpy(), logp_a.numpy()
 
-    # def act(self, obs):
-    #     return self.step(obs)[0]
+
+class DiffPrepro():
+    def __init__(self):
+        self.prev_x = None
+
+    def __call__(self, x):
+        cur_x = self.prepro_pong_v0(x)
+        if self.prev_x is None:
+            self.prev_x = cur_x
+            return np.zeros_like(cur_x)
+        else:
+            diff_x = cur_x - self.prev_x
+            self.prev_x = cur_x
+            return diff_x
+
+    def prepro_pong_v0(self, I):
+        """ prepro 210x160x3 uint8 frame into 6400 (80x80) 1D float vector """
+        I = I[35:195] # crop
+        I = I[::2,::2,0] # downsample by factor of 2
+        I[I == 144] = 0 # erase background (background type 1)
+        I[I == 109] = 0 # erase background (background type 2)
+        I[I != 0] = 1 # everything else (paddles, ball) just set to 1
+        return I.astype(np.float).ravel()
 
 
 class PPOBuffer:
@@ -222,8 +243,8 @@ class PPOBuffer:
 
 
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
+        steps_per_epoch=6000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=1e-4,
+        vf_lr=1e-4, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=6000,
         target_kl=0.01, save_freq=10, load_from=None):
     
     print(locals())
@@ -235,12 +256,13 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
-    obs_dim = env.observation_space.shape
+    obs_dim = env.observation_space.shape if args.env != 'Pong-v0' else (80*80)
+    obs_func = (lambda x: x) if args.env != 'Pong-v0' else DiffPrepro()
     act_dim = env.action_space.shape
 
     # Create actor-critic module
     if not load_from:
-        ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+        ac = actor_critic(obs_dim, env.action_space, **ac_kwargs)
     else:
         ac = torch.load('ppo_model.pt')
 
@@ -322,9 +344,10 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     for epoch in range(epochs):
         print('Epoch: {}'.format(epoch))
         for t in range(steps_per_epoch):
+            o = obs_func(o)
             a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
 
-            next_o, r, d, _, _ = env.step(a)
+            next_o, r, d, _, _ = env.step(a+2)
             ep_ret += r
             ep_len += 1
 
@@ -336,21 +359,25 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
             timeout = ep_len == max_ep_len
             terminal = d or timeout
             epoch_ended = t==steps_per_epoch-1
+            pong_ended = (r != 0 and args.env == 'Pong-v0')
 
-            if terminal or epoch_ended:
+            if terminal or epoch_ended or pong_ended:
                 if epoch_ended and not(terminal):
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(obs_func(o), dtype=torch.float32))
                 else:
                     v = 0
                 buf.finish_path(v)
+                if hasattr(obs_func, 'prev_x'):
+                    obs_func.prev_x = None
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     print(dict(EpRet=ep_ret, EpLen=ep_len))
-                o, _ = env.reset()
-                ep_ret, ep_len = 0, 0
+                if terminal or epoch_ended:
+                    o, _ = env.reset()
+                    ep_ret, ep_len = 0, 0
 
 
         # Save model
@@ -364,17 +391,17 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='CartPole-v1')
-    parser.add_argument('--hid', type=int, default=64)
-    parser.add_argument('--l', type=int, default=2)
+    parser.add_argument('--env', type=str, default='Pong-v0')
+    parser.add_argument('--hid', type=int, default=200)
+    parser.add_argument('--l', type=int, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--steps', type=int, default=40000)
+    parser.add_argument('--epochs', type=int, default=10000)
     parser.add_argument('--exp_name', type=str, default='ppo')
-    parser.add_argument('--render', type=bool, default=True)
-    parser.add_argument('--load_from', type=bool, default=True)
+    parser.add_argument('--render', type=bool, default=False)
+    parser.add_argument('--load_from', type=bool, default=False)
     args = parser.parse_args()
 
     ppo(lambda : gym.make(args.env, render_mode='human' if args.render else None), actor_critic=MLPActorCritic,
