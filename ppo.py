@@ -1,7 +1,7 @@
 import numpy as np
-import gym
+import gymnasium as gym
 import time
-from gym.spaces import Box, Discrete
+from gymnasium.spaces import Box, Discrete
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,14 @@ def combined_shape(length, shape=None):
         return (length,)
     return (length, shape) if np.isscalar(shape) else (length, *shape)
 
+def cnn(in_channels, activation=nn.ReLU):
+    return nn.Sequential(
+        nn.Conv2d(in_channels=in_channels, out_channels=16, kernel_size=8, stride=4),
+        activation(),
+        nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2),
+        activation(),
+        nn.Flatten()
+    )
 
 def mlp(sizes, activation, output_activation=nn.Identity):
     layers = []
@@ -23,28 +31,10 @@ def mlp(sizes, activation, output_activation=nn.Identity):
         layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
     return nn.Sequential(*layers)
 
-
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
 
-
 def discount_cumsum(x, discount):
-    """
-    magic from rllab for computing discounted cumulative sums of vectors.
-
-    input: 
-        vector x, 
-        [x0, 
-         x1, 
-         x2]
-
-    output:
-        [x0 + discount * x1 + discount^2 * x2,  
-         x1 + discount * x2,
-         x2]
-    """
-    # import scipy.signal
-    # return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
     res = []
     for a in x[::-1]:
         if len(res) == 0:
@@ -55,7 +45,6 @@ def discount_cumsum(x, discount):
 
 
 class Actor(nn.Module):
-
     def _distribution(self, obs):
         raise NotImplementedError
 
@@ -73,13 +62,15 @@ class Actor(nn.Module):
         return pi, logp_a
 
 
-class MLPCategoricalActor(Actor):
-    
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+class CategoricalActor(Actor):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, cnn=None):
         super().__init__()
+        self.cnn = cnn
         self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
 
     def _distribution(self, obs):
+        if self.cnn:
+            obs = self.cnn(obs)
         logits = self.logits_net(obs)
         return Categorical(logits=logits)
 
@@ -87,15 +78,17 @@ class MLPCategoricalActor(Actor):
         return pi.log_prob(act)
 
 
-class MLPGaussianActor(Actor):
-
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+class GaussianActor(Actor):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, cnn=None):
         super().__init__()
+        self.cnn = cnn
         log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
         self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
         self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
 
     def _distribution(self, obs):
+        if self.cnn:
+            obs = self.cnn(obs)
         mu = self.mu_net(obs)
         std = torch.exp(self.log_std)
         return Normal(mu, std)
@@ -104,34 +97,37 @@ class MLPGaussianActor(Actor):
         return pi.log_prob(act).sum(axis=-1)    # Last axis sum needed for Torch Normal distribution
 
 
-class MLPCritic(nn.Module):
-
-    def __init__(self, obs_dim, hidden_sizes, activation):
+class Critic(nn.Module):
+    def __init__(self, obs_dim, hidden_sizes, activation, cnn=None):
         super().__init__()
+        self.cnn = cnn
         self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs):
+        if self.cnn:
+            obs = self.cnn(obs)
         return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
 
 
-
-class MLPActorCritic(nn.Module):
-
-
-    def __init__(self, observation_space, action_space, 
-                 hidden_sizes=(64,64), activation=nn.Tanh):
+class ActorCritic(nn.Module):
+    def __init__(self, observation_dim, action_space, 
+                 hidden_sizes=(64,64), activation=nn.ReLU, cnn_enable=False, frames=3):
         super().__init__()
 
-        obs_dim = observation_space.shape[0]
+        if cnn_enable:
+            cnnet = cnn(frames, activation)
+        else:
+            cnnet = None
+        obs_dim = observation_dim
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
-            self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation)
+            self.pi = GaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation, cnnet)
         elif isinstance(action_space, Discrete):
-            self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
+            self.pi = CategoricalActor(obs_dim, action_space.n, hidden_sizes, activation, cnnet)
 
         # build value function
-        self.v  = MLPCritic(obs_dim, hidden_sizes, activation)
+        self.v  = Critic(obs_dim, hidden_sizes, activation, cnnet)
 
     def step(self, obs):
         with torch.no_grad():
@@ -139,10 +135,37 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.numpy(), v.numpy(), logp_a.numpy()
+        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
 
-    # def act(self, obs):
-    #     return self.step(obs)[0]
+
+class FramePreStacking(gym.Wrapper):
+    def __init__(self, env, n_frames=3):
+        super().__init__(env)
+        self.n_frames = n_frames
+        self.frames = np.zeros((n_frames, *(env.observation_space.shape[:-1])))
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(n_frames, *(env.observation_space.shape[:-1])), dtype=np.float64)
+        self.diffM = np.array([[1 ,0 ,0],
+                               [-2,-1,0],
+                               [1 ,1 ,1]])
+
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        self.frames = np.roll(self.frames, shift=-1, axis=0)
+        self.frames[-1] = obs[:,:,0]/255.
+        return self.preprocess(self.frames), reward, done, truncated, info
+    
+    def reset(self):
+        obs, _ = self.env.reset()
+        self.frames = np.zeros((self.n_frames, *(self.env.observation_space.shape[:-1])))
+        self.frames[-1] = obs[:,:,0]/255.
+        return self.preprocess(self.frames), _
+    
+    def preprocess(self, I):
+        # compute position, velocity, acceleration
+        I = I.transpose(1,2,0)
+        I = np.dot(I, self.diffM)
+        I = I.transpose(2,0,1)
+        return I
 
 
 class PPOBuffer:
@@ -151,8 +174,7 @@ class PPOBuffer:
     with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
     for calculating the advantages of state-action pairs.
     """
-
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95, device='cpu'):
         self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
@@ -162,6 +184,7 @@ class PPOBuffer:
         self.logp_buf = np.zeros(size, dtype=np.float32)
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+        self.device = device
 
     def store(self, obs, act, rew, val, logp):
         """
@@ -201,6 +224,8 @@ class PPOBuffer:
         
         # the next line computes rewards-to-go, to be targets for the value function
         self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
+        # another way to compute return: R = A + V (better to be a moving average of V)
+        # self.ret_buf[path_slice] = self.adv_buf[path_slice] + self.val_buf[path_slice]
         
         self.path_start_idx = self.ptr
 
@@ -214,19 +239,19 @@ class PPOBuffer:
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = self.adv_buf.mean(), self.adv_buf.std()
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        self.adv_buf = (self.adv_buf - adv_mean) / (adv_std + 1e-8)
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32).to(self.device) for k,v in data.items()}
 
 
-
-def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, save_freq=10, load_from=None):
+def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0, 
+        steps_per_epoch=6000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
+        vf_lr=3e-4, train_pi_iters=10, train_v_iters=10, lam=0.97, max_ep_len=6000,
+        target_kl=0.1, save_freq=10, load_from=None, device='cpu'):
     
     print(locals())
+    print(open(__file__).read())
 
     # Random seed
     seed = 42
@@ -235,21 +260,28 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
-    obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
+
+    if args.from_pixel:
+        cnn_enable = True
+        env = FramePreStacking(env)
+        obs_dim = (13824) # a hack number for 210x160 image and our cnn.
+    else:
+        cnn_enable = False
+        obs_dim = env.observation_space.shape
 
     # Create actor-critic module
     if not load_from:
-        ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+        ac = actor_critic(obs_dim, env.action_space, cnn_enable=cnn_enable, **ac_kwargs).to(device)
     else:
-        ac = torch.load('ppo_model.pt')
+        ac = torch.load('ppo_model_cnn.pt', map_location=device)
 
     # Count variables
     var_counts = tuple(count_vars(module) for module in [ac.pi, ac.v])
     print('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
 
     # Set up experience buffer
-    buf = PPOBuffer(obs_dim, act_dim, steps_per_epoch, gamma, lam)
+    buf = PPOBuffer(env.observation_space.shape, act_dim, steps_per_epoch, gamma, lam, device)
 
     # Set up function for computing PPO policy loss
     def compute_loss_pi(data):
@@ -263,14 +295,14 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
-        ent = pi.entropy().mean().item()
+        ent = pi.entropy().mean().item() # you can also add entropy bonus to loss_pi to encourage exploration.
         clipped = ratio.gt(1+clip_ratio) | ratio.lt(1-clip_ratio)
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
         pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
 
         return loss_pi, pi_info
 
-    # Set up function for computing value loss
+    # Set up function for computing value loss, you can also use clipped version of loss_v.
     def compute_loss_v(data):
         obs, ret = data['obs'], data['ret']
         return ((ac.v(obs) - ret)**2).mean()
@@ -282,11 +314,6 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     def update():
         data = buf.get()
-
-        pi_l_old, pi_info_old = compute_loss_pi(data)
-        pi_l_old = pi_l_old.item()
-        v_l_old = compute_loss_v(data).item()
-
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
@@ -307,11 +334,9 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
             vf_optimizer.step()
 
         # Log changes from update
-        kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        print(dict(LossPi=pi_l_old, LossV=v_l_old,
-                     KL=kl, Entropy=ent, ClipFrac=cf,
-                     DeltaLossPi=(loss_pi.item() - pi_l_old),
-                     DeltaLossV=(loss_v.item() - v_l_old)))
+        kl, ent, cf = pi_info['kl'], pi_info['ent'], pi_info['cf']
+        print(dict(LossPi=loss_pi.item(), LossV=loss_v.item(),
+                     KL=kl, Entropy=ent, ClipFrac=cf))
 
     # Prepare for interaction with environment
     start_time = time.time()
@@ -322,40 +347,40 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     for epoch in range(epochs):
         print('Epoch: {}'.format(epoch))
         for t in range(steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32).unsqueeze(0).to(device))
+            a = a.squeeze(0)
 
             next_o, r, d, _, _ = env.step(a)
             ep_ret += r
             ep_len += 1
 
-            # save and log
             buf.store(o, a, r, v, logp)
-            
             o = next_o
 
             timeout = ep_len == max_ep_len
             terminal = d or timeout
             epoch_ended = t==steps_per_epoch-1
+            pong_ended = (r != 0 and 'Pong' in args.env)
 
-            if terminal or epoch_ended:
-                if epoch_ended and not(terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
+            if terminal or epoch_ended or pong_ended:
+                # if epoch_ended and not(terminal):
+                #     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32).unsqueeze(0).to(device))
                 else:
                     v = 0
                 buf.finish_path(v)
                 if terminal:
-                    # only save EpRet / EpLen if trajectory finished
                     print(dict(EpRet=ep_ret, EpLen=ep_len))
-                o, _ = env.reset()
-                ep_ret, ep_len = 0, 0
+                if terminal or epoch_ended:
+                    o, _ = env.reset()
+                    ep_ret, ep_len = 0, 0
 
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
-            torch.save(ac, 'ppo_model.pt')
+            torch.save(ac, 'ppo_model_cnn.pt')
 
         # Perform PPO update!
         update()
@@ -364,19 +389,23 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='CartPole-v1')
-    parser.add_argument('--hid', type=int, default=64)
-    parser.add_argument('--l', type=int, default=2)
+    # pip install "gymnasium[atari, accept-rom-license]"
+    parser.add_argument('--env', type=str, default='Pong-v0')
+    # parser.add_argument('--env', type=str, default='CartPole-v1')
+    parser.add_argument('--hid', type=int, default=256)
+    parser.add_argument('--l', type=int, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--steps', type=int, default=6000)
+    parser.add_argument('--epochs', type=int, default=10000)
     parser.add_argument('--exp_name', type=str, default='ppo')
-    parser.add_argument('--render', type=bool, default=True)
-    parser.add_argument('--load_from', type=bool, default=True)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--from_pixel', type=bool, default=True)
+    parser.add_argument('--render', type=bool, default=False)
+    parser.add_argument('--load_from', type=bool, default=False)
     args = parser.parse_args()
 
-    ppo(lambda : gym.make(args.env, render_mode='human' if args.render else None), actor_critic=MLPActorCritic,
+    ppo(lambda : gym.make(args.env, render_mode='human' if args.render else None), actor_critic=ActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
-        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs, load_from=args.load_from)
+        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs, load_from=args.load_from, device=torch.device(args.device))
