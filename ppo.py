@@ -268,7 +268,7 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
         obs_dim = (13824) # a hack number for 210x160 image and our cnn.
     else:
         cnn_enable = False
-        obs_dim = env.observation_space.shape
+        obs_dim = env.observation_space.shape[0]
 
     # Create actor-critic module
     if not load_from:
@@ -313,7 +313,7 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
 
 
     def update():
-        data = buf.get()
+        data = buf.get() # here we use a single batch of data, you can also use multiple mini-batches of data to update.
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
@@ -371,9 +371,10 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
                 else:
                     v = 0
                 buf.finish_path(v)
-                if terminal:
-                    print(dict(EpRet=ep_ret, EpLen=ep_len))
+                # if terminal:
+                #     print(dict(EpRet=ep_ret, EpLen=ep_len))
                 if terminal or epoch_ended:
+                    print(dict(EpRet=ep_ret, EpLen=ep_len))
                     o, _ = env.reset()
                     ep_ret, ep_len = 0, 0
 
@@ -392,20 +393,22 @@ if __name__ == '__main__':
     # pip install "gymnasium[atari, accept-rom-license]"
     parser.add_argument('--env', type=str, default='Pong-v0')
     # parser.add_argument('--env', type=str, default='CartPole-v1')
+    # python singularity2.py --env CartPole-v1 --steps 500 --kl 0.01 --device cpu
+    # python singularity2.py --env CartPole-v1 --steps 5000 --kl 0.01 --device cpu --render True --load_from True
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=1)
+    parser.add_argument('--kl', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=6000)
     parser.add_argument('--epochs', type=int, default=10000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--from_pixel', type=bool, default=True)
+    parser.add_argument('--from_pixel', type=bool, default=False)
     parser.add_argument('--render', type=bool, default=False)
     parser.add_argument('--load_from', type=bool, default=False)
     args = parser.parse_args()
 
     ppo(lambda : gym.make(args.env, render_mode='human' if args.render else None), actor_critic=ActorCritic,
-        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
+        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), target_kl=args.kl, gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs, load_from=args.load_from, device=torch.device(args.device))
