@@ -274,7 +274,7 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
     if not load_from:
         ac = actor_critic(obs_dim, env.action_space, cnn_enable=cnn_enable, **ac_kwargs).to(device)
     else:
-        ac = torch.load('ppo_model_cnn.pt', map_location=device)
+        ac = torch.load('ppo_model.pt', map_location=device)
 
     # Count variables
     var_counts = tuple(count_vars(module) for module in [ac.pi, ac.v])
@@ -381,7 +381,7 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
-            torch.save(ac, 'ppo_model_cnn.pt')
+            torch.save(ac, 'ppo_model.pt')
 
         # Perform PPO update!
         update()
@@ -392,9 +392,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # pip install "gymnasium[atari, accept-rom-license]"
     parser.add_argument('--env', type=str, default='Pong-v0')
-    # parser.add_argument('--env', type=str, default='CartPole-v1')
     # python singularity2.py --env CartPole-v1 --steps 500 --kl 0.01 --device cpu
-    # python singularity2.py --env CartPole-v1 --steps 5000 --kl 0.01 --device cpu --render True --load_from True
+    # python singularity2.py --env CartPole-v1 --steps 5000 --kl 0.01 --device cpu --render --load_from
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=1)
     parser.add_argument('--kl', type=float, default=0.1)
@@ -404,9 +403,9 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--from_pixel', type=bool, default=False)
-    parser.add_argument('--render', type=bool, default=False)
-    parser.add_argument('--load_from', type=bool, default=False)
+    parser.add_argument('--from_pixel', action="store_true")
+    parser.add_argument('--render', action="store_true")
+    parser.add_argument('--load_from', action="store_true")
     args = parser.parse_args()
 
     ppo(lambda : gym.make(args.env, render_mode='human' if args.render else None), actor_critic=ActorCritic,
