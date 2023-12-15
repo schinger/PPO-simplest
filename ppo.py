@@ -390,10 +390,7 @@ def ppo(env_fn, actor_critic=ActorCritic, ac_kwargs=dict(), seed=0,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    # pip install "gymnasium[atari, accept-rom-license]"
     parser.add_argument('--env', type=str, default='Pong-v0')
-    # python singularity2.py --env CartPole-v1 --steps 500 --kl 0.01 --device cpu
-    # python singularity2.py --env CartPole-v1 --steps 5000 --kl 0.01 --device cpu --render --load_from
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=1)
     parser.add_argument('--kl', type=float, default=0.1)
